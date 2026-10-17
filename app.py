@@ -1,5 +1,8 @@
+cd ~/telegram_qp_finder_bot
+
+cat << 'EOF' > qp_finder.py
+#!/usr/bin/env python3
 import asyncio, io, logging, os, re, sqlite3, sys
-from aiohttp import web
 from telethon import TelegramClient, events, types
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeFilename
@@ -7,20 +10,18 @@ from telethon.errors import FloodWaitError
 import pypdf
 
 logging.basicConfig(format="%(asctime)s - [%(levelname)s]: %(message)s", level=logging.INFO)
-logger = logging.getLogger("render_bot")
+logger = logging.getLogger("qp_finder")
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "36822080"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "430634fb7d9e5955d7ee76ed8c826ebb")
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "").strip()
-PORT = int(os.getenv("PORT", "10000"))
+SESSION_NAME = os.getenv("SESSION_NAME", "qp_finder_session").strip()
 
-if not SESSION_STRING:
-    logger.error("TELEGRAM_SESSION_STRING environment variable is missing!")
-    sys.exit(1)
+if SESSION_STRING:
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+else:
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-
-# --- SQLite Database Initialization ---
 def init_db():
     conn = sqlite3.connect("academic_index.db")
     conn.execute("""
@@ -40,7 +41,12 @@ def init_db():
 
 init_db()
 
-# --- Advanced Query Parser (Exact Quotes, +, -, AND, OR, NOT) ---
+def extract_terms(raw_query: str):
+    neg_matches = re.findall(r'-(\"[^\"]+\"|\w+)', raw_query.strip())
+    negatives = [m.strip('"').lower() for m in neg_matches]
+    pos_q = re.sub(r'-(?:\"[^\"]+\"|\w+)', '', raw_query).strip()
+    return pos_q, negatives
+
 def parse_fts5_query(user_query: str) -> str:
     pattern = r'(-\"[^\"]+\"|-\w+|\"[^\"]+\"|\w+|AND|OR|NOT)'
     matches = re.findall(pattern, user_query.strip())
@@ -52,9 +58,6 @@ def parse_fts5_query(user_query: str) -> str:
         upper = m.upper()
         if upper in ('AND', 'OR', 'NOT'):
             tokens.append(upper)
-        elif m.startswith('-'):
-            clean = m[1:].strip('"')
-            tokens.extend(['NOT', f'"{clean}"'])
         elif m.startswith('+'):
             clean = m[1:].strip('"')
             tokens.extend(['AND', f'"{clean}"'])
@@ -78,21 +81,44 @@ def parse_fts5_query(user_query: str) -> str:
 
     return ' '.join(clean_terms) if clean_terms else '""'
 
-def search_pdf_content(query, limit=10):
-    fts_expr = parse_fts5_query(query)
+def search_pdf_content(raw_query, limit=10):
+    pos_query, neg_terms = extract_terms(raw_query)
+    pos_fts = parse_fts5_query(pos_query)
+    if not pos_fts or pos_fts == '""':
+        return []
+
     results = []
     with sqlite3.connect("academic_index.db") as conn:
         cursor = conn.cursor()
+        disqualified_docs = set()
+        if neg_terms:
+            neg_fts = " OR ".join([f'"{n}"' for n in neg_terms])
+            try:
+                cursor.execute("SELECT DISTINCT chat_id, message_id FROM pdf_pages_fts WHERE pdf_pages_fts MATCH ?", (neg_fts,))
+                disqualified_docs = {(row[0], row[1]) for row in cursor.fetchall()}
+            except Exception:
+                pass
+
         try:
             cursor.execute("""
                 SELECT chat_id, message_id, chat_title, file_name, page_num,
                        snippet(pdf_pages_fts, 5, '<b>', '</b>', '...', 18)
-                FROM pdf_pages_fts WHERE pdf_pages_fts MATCH ? ORDER BY rank LIMIT ?;
-            """, (fts_expr, limit))
+                FROM pdf_pages_fts WHERE pdf_pages_fts MATCH ? ORDER BY rank LIMIT 30;
+            """, (pos_fts,))
+            
             for row in cursor.fetchall():
-                results.append({"chat_id": int(row[0]), "msg_id": int(row[1]), "title": row[2], "file": row[3], "page": int(row[4]), "snippet": row[5]})
+                key = (int(row[0]), int(row[1]))
+                if key in disqualified_docs:
+                    continue
+                results.append({
+                    "chat_id": key[0], "msg_id": key[1], "title": row[2],
+                    "file": row[3], "page": int(row[4]), "snippet": row[5]
+                })
+                if len(results) >= limit:
+                    break
         except Exception as e:
-            logger.error(f"FTS Query failed for '{fts_expr}': {e}")
+            logger.error(f"FTS Query failed: {e}")
+            
     return results
 
 def get_doc_filename(msg):
@@ -102,11 +128,11 @@ def get_doc_filename(msg):
                 return attr.file_name
     return None
 
-# --- Telegram Commands ---
 @client.on(events.NewMessage(pattern=r"(?i)^[./](qp|find|pyq)\s+(.+)", outgoing=True))
 async def on_search(event):
     query = event.pattern_match.group(2).strip()
-    status_msg = await event.reply(f"🔍 <b>Filtering across internal PDF pages for:</b> <code>{query}</code>...", parse_mode="html")
+    pos_query, neg_terms = extract_terms(query)
+    status_msg = await event.reply(f"🔍 <b>Filtering across PDF contents for:</b> <code>{query}</code>...", parse_mode="html")
     
     deep_matches = search_pdf_content(query)
     forwarded = set()
@@ -131,15 +157,21 @@ async def on_search(event):
                     await asyncio.sleep(0.4)
             except Exception: pass
 
-    # Also search regular group message titles/captions
-    clean_words = [w for w in re.findall(r'\w+', query) if len(w) >= 3 and w.upper() not in ('AND', 'OR', 'NOT')]
-    simple_query = " ".join(clean_words[:2]) if clean_words else query
+    clean_words = [w for w in re.findall(r'\w+', pos_query) if len(w) >= 3 and w.upper() not in ('AND', 'OR', 'NOT')]
+    simple_query = " ".join(clean_words[:2]) if clean_words else pos_query
     async for dialog in client.iter_dialogs():
         if not (dialog.is_group or dialog.is_channel): continue
         try:
-            async for msg in client.iter_messages(dialog, search=simple_query, filter=types.InputMessagesFilterDocument, limit=6):
+            async for msg in client.iter_messages(dialog, search=simple_query, filter=types.InputMessagesFilterDocument, limit=8):
                 key = (dialog.id, msg.id)
                 if key in forwarded: continue
+                fname = get_doc_filename(msg)
+                
+                caption = msg.message or ""
+                search_corpus = f"{fname or ''} {caption}".lower()
+                if any(neg in search_corpus for neg in neg_terms):
+                    continue
+
                 forwarded.add(key)
                 await client.forward_messages("me", msg)
                 count += 1
@@ -193,25 +225,23 @@ async def on_index(event):
 
     await status_msg.edit(f"✅ <b>Indexing Complete!</b>\nIndexed {total_files} new PDFs ({total_pages} pages). You can now search with full AND, OR, NOT filters!", parse_mode="html")
 
-# --- Dummy HTTP Server for Render Health Check ---
-async def handle_ping(request):
-    return web.Response(text="Bot is running!")
-
-async def start_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/healthz", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"Health check listening on port {PORT}")
-
 async def main():
-    await start_server()
+    port = int(os.getenv("PORT", "0"))
+    if port > 0:
+        from aiohttp import web
+        async def ping(r): return web.Response(text="Bot active")
+        app = web.Application()
+        app.router.add_get("/", ping)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+
     await client.start()
-    logger.info("Telegram Client connected and active on Render!")
+    logger.info("Bot is connected and running!")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
     asyncio.run(main())
+EOF
+
+python3 qp_finder.py
