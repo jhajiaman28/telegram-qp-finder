@@ -1,8 +1,5 @@
-cd ~/telegram_qp_finder_bot
-
-cat << 'EOF' > qp_finder.py
-#!/usr/bin/env python3
 import asyncio, io, logging, os, re, sqlite3, sys
+from aiohttp import web
 from telethon import TelegramClient, events, types
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeFilename
@@ -10,17 +7,18 @@ from telethon.errors import FloodWaitError
 import pypdf
 
 logging.basicConfig(format="%(asctime)s - [%(levelname)s]: %(message)s", level=logging.INFO)
-logger = logging.getLogger("qp_finder")
+logger = logging.getLogger("render_bot")
 
 API_ID = int(os.getenv("TELEGRAM_API_ID", "36822080"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "430634fb7d9e5955d7ee76ed8c826ebb")
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "").strip()
-SESSION_NAME = os.getenv("SESSION_NAME", "qp_finder_session").strip()
+PORT = int(os.getenv("PORT", "10000"))
 
-if SESSION_STRING:
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-else:
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+if not SESSION_STRING:
+    logger.error("TELEGRAM_SESSION_STRING environment variable is missing!")
+    sys.exit(1)
+
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 def init_db():
     conn = sqlite3.connect("academic_index.db")
@@ -225,23 +223,24 @@ async def on_index(event):
 
     await status_msg.edit(f"✅ <b>Indexing Complete!</b>\nIndexed {total_files} new PDFs ({total_pages} pages). You can now search with full AND, OR, NOT filters!", parse_mode="html")
 
-async def main():
-    port = int(os.getenv("PORT", "0"))
-    if port > 0:
-        from aiohttp import web
-        async def ping(r): return web.Response(text="Bot active")
-        app = web.Application()
-        app.router.add_get("/", ping)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", port).start()
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
 
+async def start_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/healthz", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Health check listening on port {PORT}")
+
+async def main():
+    await start_server()
     await client.start()
-    logger.info("Bot is connected and running!")
+    logger.info("Telegram Client connected and active on Render!")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
     asyncio.run(main())
-EOF
-
-python3 qp_finder.py
