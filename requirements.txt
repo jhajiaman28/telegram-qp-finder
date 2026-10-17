@@ -1,0 +1,4 @@
+telethon
+pypdf
+python-dotenv
+aiohttp
