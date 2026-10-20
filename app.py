@@ -16,6 +16,7 @@ API_HASH = os.getenv("TELEGRAM_API_HASH", "430634fb7d9e5955d7ee76ed8c826ebb")
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "").strip()
 SESSION_NAME = os.getenv("SESSION_NAME", "qp_finder_session").strip()
 PORT = int(os.getenv("PORT", "10000"))
+MAX_PAGES = 50  # Hard guardrail to skip heavy textbooks
 
 if SESSION_STRING:
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -133,7 +134,7 @@ def get_doc_filename(msg):
 async def on_start_help(event):
     guide_text = (
         "📚 <b>Academic Question Paper & Channel Finder Bot</b>\n"
-        "<i>Command Reference Card</i>\n"
+        "<i>Quick Command & Filter Guide</i>\n"
         "───────────────────────────────\n\n"
         "🔍 <b>1. Search Joined Groups & PDF Pages</b>\n"
         "• <code>.qp &lt;topic&gt;</code> or <code>.find &lt;topic&gt;</code>\n"
@@ -144,16 +145,16 @@ async def on_start_help(event):
         "• <code>.global &lt;topic&gt;</code>\n"
         "  Searches public Telegram channels for PDFs (without needing to join them) and forwards them.\n"
         "  <i>Example:</i> <code>.global ABVMU MBBS Question Paper</code>\n"
-        "  <i>Example:</i> <code>.global Anatomy Dissection Solved</code>\n\n"
+        "  <i>Example:</i> <code>.global Pediatrics PYQ</code>\n\n"
         "📡 <b>3. Discover New Study Channels</b>\n"
         "• <code>.channel &lt;topic&gt;</code>\n"
         "  Discovers public medical channels, question banks, and notes archives.\n"
         "  <i>Example:</i> <code>.channel MBBS Anatomy</code>\n"
-        "  <i>Example:</i> <code>.channel Medical PYQ</code>\n\n"
+        "  <i>Example:</i> <code>.channel Pediatrics Question Bank</code>\n\n"
         "⚙️ <b>4. Indexing & Database Management</b>\n"
-        "• <code>.index</code> — Scans all joined groups to index text from PDF pages.\n"
+        "• <code>.index</code> — Scans all joined groups to index text from PDF pages (skips textbooks >50 pages).\n"
         "• <code>.status</code> — Shows how many PDFs, pages, and groups are indexed.\n\n"
-        "💡 <b>Search Filters & Operators Cheat Sheet:</b>\n"
+        "💡 <b>Search Filters & Operators:</b>\n"
         "• <b>Must Only Contain (Exact):</b> <code>\"Upper Limb\"</code> in quotes\n"
         "• <b>Must Also Contain (AND):</b> <code>+</code> or <code>AND</code> (e.g. <code>Anatomy + Thorax</code>)\n"
         "• <b>Either / Or (OR):</b> <code>OR</code> (e.g. <code>Anatomy OR Physiology</code>)\n"
@@ -255,27 +256,40 @@ async def on_global_search(event):
             channel_title = chat_obj.title if chat_obj else "Public Channel"
             username = getattr(chat_obj, "username", None)
             channel_link = f"https://t.me/{username}" if username else "Public"
+            msg_link = f"https://t.me/{username}/{msg.id}" if username else channel_link
 
             await event.reply(
                 f"🌐 <b>Global Find:</b> 📄 <code>{fname}</code>\n"
-                f"📢 <b>From Channel:</b> <a href=\"{channel_link}\">{channel_title}</a>",
+                f"📢 <b>From Channel:</b> <a href=\"{channel_link}\">{channel_title}</a>\n"
+                f"🔗 <a href=\"{msg_link}\"><b>Open File in Channel</b></a>",
                 parse_mode="html",
                 link_preview=False
             )
-            await client.forward_messages("me", msg)
+
+            try:
+                await client.forward_messages("me", msg)
+            except Exception as fwd_err:
+                if "protected" in str(fwd_err).lower() or "restrict" in str(fwd_err).lower():
+                    await event.reply(
+                        "🔒 <i>Note: This channel has forwarding restricted. Use the <b>Open File in Channel</b> link above to download it directly!</i>",
+                        parse_mode="html"
+                    )
+                else:
+                    logger.warning(f"Forward failed: {fwd_err}")
+
             forwarded_count += 1
             await asyncio.sleep(0.4)
             if forwarded_count >= 8:
                 break
 
         if forwarded_count == 0:
-            await status_msg.edit(f"❌ No public channel PDFs found for <code>{query}</code>.\n💡 <i>Try broader terms like <code>.global Anatomy PYQ</code>.</i>", parse_mode="html")
+            await status_msg.edit(f"❌ No public channel PDFs found for <code>{query}</code>.\n💡 <i>Try broader terms like <code>.global Pediatrics PYQ</code>.</i>", parse_mode="html")
         else:
-            await status_msg.edit(f"🏁 Found and forwarded {forwarded_count} global public PDFs for <b>{query}</b>.", parse_mode="html")
+            await status_msg.edit(f"🏁 Found {forwarded_count} global public PDFs for <b>{query}</b>.", parse_mode="html")
 
     except Exception as e:
         logger.error(f"Global search error: {e}")
-        await status_msg.edit(f"❌ Global search failed: <code>{e}</code>", parse_mode="html")
+        await status_msg.edit(f"❌ Global search error: <code>{e}</code>", parse_mode="html")
 
 # --- Command 4: Channel Discoverer (.channel) ---
 @client.on(events.NewMessage(pattern=r"(?i)^[./]channel\s+(.+)", outgoing=True))
@@ -309,32 +323,55 @@ async def on_channel_discover(event):
         logger.error(f"Channel search error: {e}")
         await status_msg.edit(f"❌ Channel discovery failed: <code>{e}</code>", parse_mode="html")
 
-# --- Command 5: Deep Indexer (.index) ---
+# --- Command 5: Deep Indexer with 50-Page Cap (.index) ---
 @client.on(events.NewMessage(pattern=r"(?i)^[./]index", outgoing=True))
 async def on_index(event):
-    status_msg = await event.reply("⏳ <b>Scanning and deep-indexing all group PDFs...</b>", parse_mode="html")
+    status_msg = await event.reply("⏳ <b>Scanning and deep-indexing question papers (skipping textbooks >50 pages)...</b>", parse_mode="html")
     total_files = 0
     total_pages = 0
+    skipped_books = 0
+
+    exam_keywords = [
+        "qp", "pyq", "question", "paper", "exam", "test", "internal",
+        "terminal", "annual", "university", "abvmu", "prof", "sent up",
+        "assessment", "bank", "solved", "pre-prof", "model", "viva"
+    ]
 
     async for dialog in client.iter_dialogs():
         if not (dialog.is_group or dialog.is_channel): continue
         chat_title = dialog.name or f"Chat {dialog.id}"
         try:
-            async for msg in client.iter_messages(dialog, filter=types.InputMessagesFilterDocument, limit=40):
+            async for msg in client.iter_messages(dialog, filter=types.InputMessagesFilterDocument, limit=50):
                 fname = get_doc_filename(msg)
                 if not fname or not fname.lower().endswith(".pdf"): continue
-                if (msg.media.document.size or 0) > 30 * 1024 * 1024: continue
+
+                caption = msg.message or ""
+                search_text = f"{fname} {caption}".lower()
+                is_exam_doc = any(re.search(r'\b' + re.escape(kw) + r'\b', search_text) for kw in exam_keywords)
+                if not is_exam_doc:
+                    continue
 
                 with sqlite3.connect("academic_index.db") as conn:
                     cur = conn.cursor()
                     cur.execute("SELECT 1 FROM indexed_files WHERE chat_id=? AND message_id=?", (dialog.id, msg.id))
                     if cur.fetchone(): continue
 
+                if (msg.media.document.size or 0) > 25 * 1024 * 1024:
+                    skipped_books += 1
+                    continue
+
                 pdf_bytes = await client.download_media(msg, file=bytes)
                 if not pdf_bytes: continue
 
                 try:
                     reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+                    page_count = len(reader.pages)
+
+                    # STRICT 50-PAGE GUARDRAIL: Skip large textbooks immediately
+                    if page_count > MAX_PAGES:
+                        skipped_books += 1
+                        continue
+
                     with sqlite3.connect("academic_index.db") as conn:
                         p_indexed = 0
                         for idx, page in enumerate(reader.pages, 1):
@@ -350,7 +387,14 @@ async def on_index(event):
                 except Exception: pass
         except Exception: continue
 
-    await status_msg.edit(f"✅ <b>Indexing Complete!</b>\nIndexed {total_files} new PDFs ({total_pages} pages). Send <code>.start</code> for search tips!", parse_mode="html")
+    summary = (
+        f"✅ <b>Indexing Complete!</b>\n"
+        f"───────────────────────────────\n"
+        f"• <b>Indexed Papers:</b> {total_files} PDFs ({total_pages} pages)\n"
+        f"• <b>Skipped Textbooks (&gt;50 pages):</b> {skipped_books}\n\n"
+        f"👉 <i>Search any topic using <code>.qp &lt;topic&gt;</code> or send <code>.start</code> for help!</i>"
+    )
+    await status_msg.edit(summary, parse_mode="html")
 
 # --- Command 6: Database Stats (.status) ---
 @client.on(events.NewMessage(pattern=r"(?i)^[./]status", outgoing=True))
@@ -364,10 +408,11 @@ async def on_status(event):
     size_mb = os.path.getsize("academic_index.db") / (1024 * 1024) if os.path.exists("academic_index.db") else 0
     await event.reply(
         f"📊 <b>Academic Index Database Status:</b>\n"
-        f"• <b>Indexed PDFs:</b> {tot_files}\n"
+        f"• <b>Indexed Papers:</b> {tot_files}\n"
         f"• <b>Indexed Pages:</b> {tot_pages}\n"
         f"• <b>Active Groups:</b> {tot_groups}\n"
-        f"• <b>Database Size:</b> {size_mb:.2f} MB\n\n"
+        f"• <b>Database Size:</b> {size_mb:.2f} MB\n"
+        f"• <b>Page Limit:</b> Max {MAX_PAGES} pages/file (textbooks skipped)\n\n"
         f"<i>Send <code>.index</code> to update or <code>.start</code> for commands!</i>",
         parse_mode="html"
     )
